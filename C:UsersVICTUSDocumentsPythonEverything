@@ -1,0 +1,692 @@
+==> configs/speech_to_text_hf_finetune.yaml <==
+name: "Speech_To_Text_HF_Finetuning_using_HF_Datasets"
+
+# use `init_from_nemo_model` or `init_from_pretrained_model` to initialize the model
+# We do not currently support `init_from_ptl_ckpt` to create a single script for all types of models.
+init_from_nemo_model: null  # path to nemo model
+init_from_pretrained_model: nvidia/parakeet-tdt-0.6b-v3  # name of pretrained NeMo model, e.g., `stt_en_fastconformer_transducer_large`
+
+model:
+  sample_rate: 16000
+
+  # configs for huggingface load_dataset function
+  data_path: "librispeech_asr"
+  data_name: null  # name for the specific dataset to load, e.g., 'en' for MCV datasets, but some datasets don't require this field.
+  streaming: false # set True to use streaming mode, which doesn't wait for data downloading but each training step takes longer in the first epoch. If True, you'll need to specify trainer.max_steps and trainer.limit_train_batches, instead of trainer.max_epochs.
+
+  # keys for audio, sample_rate and transcription in the huggingface dataset, keys seperated by `.` for nested fields. See example at the bottom of this file.
+  audio_key: "audio.array"
+  sample_rate_key: "audio.sampling_rate"
+  text_key: "text"  # the key for groundtruth transcription, e.g., MCV usually uses "sentence" while some others use "text"
+
+  # simple text cleaning, by default converts all chars to lower-case and only keeps alpha-numeric chars.
+  normalize_text: true
+  symbols_to_keep: ["'"]  # a list of symbols to keep during text cleaning.
+
+  compute_eval_loss: false
+  log_prediction: true
+  rnnt_prediction: 'mean_volume'
+  skip_nan_grad: false
+
+  train_ds:
+    manifest_filepath: "hugginface"  # set to a not None value to avoid breaking existing code
+    streaming: ${model.streaming}
+    normalize_text: ${model.normalize_text}
+    symbols_to_keep: ${model.symbols_to_keep}
+    audio_key: ${model.audio_key}
+    sample_rate_key: ${model.sample_rate_key}
+    text_key:  ${model.text_key}
+    hf_data_cfg:  # hf_data_cfg can be a ListConfig or DictConfig. Params for each data are passed into huggingface load_dataset(). Add more params if needed
+      - path: ${model.data_path}
+        name: ${model.data_name}
+        split: 'train.clean.360'
+        streaming: ${model.streaming}
+        trust_remote_code: true
+      - path: ${model.data_path}
+        name: ${model.data_name}
+        split: 'train.clean.100'
+        streaming: ${model.streaming}
+        trust_remote_code: true
+      - path: ${model.data_path}
+        name: ${model.data_name}
+        split: 'train.other.500'
+        streaming: ${model.streaming}
+        trust_remote_code: true
+  
+    sample_rate: ${model.sample_rate}
+    batch_size: 16 # you may increase batch_size if your memory allows
+    shuffle: true
+    shuffle_n: 2048
+    num_workers: 2
+    pin_memory: true
+    use_start_end_token: false
+
+  validation_ds:
+    manifest_filepath: "hugginface"  # set to a not None value to avoid breaking existing code
+    streaming: ${model.streaming}
+    normalize_text: ${model.normalize_text}
+    symbols_to_keep: ${model.symbols_to_keep}
+    audio_key: ${model.audio_key}
+    sample_rate_key: ${model.sample_rate_key}
+    text_key:  ${model.text_key}
+    hf_data_cfg:  # An example of using only one dataset
+      path: ${model.data_path}
+      name: ${model.data_name}
+      split: 'validation.other'
+      streaming: ${model.streaming}
+      trust_remote_code: true
+
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    shuffle_n: 2048
+    num_workers: 2
+    pin_memory: true
+    use_start_end_token: false
+
+  test_ds:
+    manifest_filepath: "hugginface"  # set to a not None value to avoid breaking existing code
+    streaming: ${model.streaming}
+    normalize_text: ${model.normalize_text}
+    symbols_to_keep: ${model.symbols_to_keep}
+    audio_key: ${model.audio_key}
+    sample_rate_key: ${model.sample_rate_key}
+    text_key:  ${model.text_key}
+    hf_data_cfg:  # hf_data_cfg can be a ListConfig or DictConfig. Params for each data are passed into huggingface load_dataset(). Add more params if needed
+      - path: ${model.data_path}
+        name: ${model.data_name}
+        split: 'test.other'
+        streaming: ${model.streaming}
+        trust_remote_code: true
+      - path: ${model.data_path}
+        name: ${model.data_name}
+        split: 'test.clean'
+        streaming: ${model.streaming}
+        trust_remote_code: true
+
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    shuffle_n: 2048
+    num_workers: 2
+    pin_memory: true
+    use_start_end_token: false
+
+  char_labels: # use for char based models
+    update_labels: false
+    labels: null # example list config: \[' ', 'a', 'b', 'c'\]
+
+  tokenizer: # use for spe/bpe based tokenizer models
+    update_tokenizer: false
+    dir: null  # path to directory which contains either tokenizer.model (bpe) or vocab.txt (for wpe)
+    type: bpe  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer)
+  
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2 # set to zero to disable it
+    time_masks: 10 # set to zero to disable it
+    freq_width: 27
+    time_width: 0.05
+
+  optim:
+    name: adamw
+    lr: 1e-4
+    # optimizer arguments
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+
+    # scheduler setup
+    sched:
+      name: CosineAnnealing
+      # scheduler config override
+      warmup_steps: 5000
+      warmup_ratio: null
+      min_lr: 5e-6
+
+trainer:
+  devices: -1 # number of GPUs, -1 would use all available GPUs
+  num_nodes: 1
+  max_epochs: 500
+  max_steps: 4188 # computed at runtime if not set
+  val_check_interval: 100 # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
+  accelerator: auto
+  strategy:
+    _target_: lightning.pytorch.strategies.DDPStrategy
+    gradient_as_bucket_view: true
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  precision: bf16-mixed # 16, 32, or bf16
+  log_every_n_steps: 100  # Interval of logging.
+  enable_progress_bar: True
+  num_sanity_val_steps: 0 # number of steps to perform validation steps for sanity check the validation process before starting the training, setting to 0 disables it
+  check_val_every_n_epoch: 1 # number of evaluations on validation every n epochs
+  sync_batchnorm: true
+  enable_checkpointing: false  # Provided by exp_manager
+  logger: false  # Provided by exp_manager
+  benchmark: false # needs to be false for models with variable-length speech input as it slows down training
+
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    # in case of multiple validation sets, first one is used
+    monitor: "val_wer"
+    mode: "min"
+    save_top_k: 2
+    always_save_nemo: True # saves the checkpoints as nemo files along with PTL checkpoints
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
+
+
+# An example item in the HuggingFace `librispeech_asr` dataset:
+# {'chapter_id': 141231,
+#  'file': '/home/patrick/.cache/huggingface/datasets/downloads/extracted/b7ded9969e09942ab65313e691e6fc2e12066192ee8527e21d634aca128afbe2/dev_clean/1272/141231/1272-141231-0000.flac',
+#  'audio': {
+#    'path': '/home/patrick/.cache/huggingface/datasets/downloads/extracted/b7ded9969e09942ab65313e691e6fc2e12066192ee8527e21d634aca128afbe2/dev_clean/1272/141231/1272-141231-0000.flac',
+#    'array': array([-0.00048828, -0.00018311, -0.00137329, ...,  0.00079346, 0.00091553,  0.00085449], dtype=float32),
+#    'sampling_rate': 16000
+#   },
+# 'id': '1272-141231-0000',
+# 'speaker_id': 1272,
+# 'text': 'A MAN SAID TO THE UNIVERSE SIR I EXIST'}
+
+==> src/fongbe/__init__.py <==
+def main() -> None:
+    print("Hello from fongbe!")
+
+==> src/fongbe/dataloader.py <==
+import io
+import torch
+import soundfile as sf
+import librosa
+from collections.abc import Callable
+from torch.utils.data import IterableDataset, DataLoader
+from datasets import load_dataset, interleave_datasets, Audio
+
+# 1. Load each language/repo in streaming mode (0 GB disk)
+# Using decode=False + soundfile avoids TorchCodec/FFmpeg issues
+
+REPO_ID = "nolimitsxl/fongbe-challenge"
+def load_stream(repo, config, split="train", columns: list[str] = ["audio", "text"]):
+    ds = load_dataset(repo, config, split=split, streaming=True)
+    ds = ds.cast_column("audio", Audio(decode=False))
+    ds = ds.select_columns(columns)
+    return ds
+
+def load_stream_by_data_file(datafile: dict, split: str="train", columns: list[str] = ["audio", "text"]):
+    ds = load_dataset("parquet", data_files=datafile, split=split, streaming=True)
+    ds = ds.cast_column("audio", Audio(decode=False))
+    ds = ds.select_columns(columns)
+    return ds
+
+# 3. Wrap as a PyTorch IterableDataset for NeMo
+class NeMoStreamingASRDataset(IterableDataset):
+    def __init__(self, hf_iterable, tokenizer, max_sec=15.0):
+        self.hf_iterable = hf_iterable
+        self.tokenizer = tokenizer
+        self.max_sec = max_sec
+
+    def __iter__(self):
+        for ex in self.hf_iterable:
+            audio_info = ex["audio"]
+            raw_bytes = audio_info["bytes"]
+            wav, sr = sf.read(io.BytesIO(raw_bytes), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            if sr != 16000:
+                wav = librosa.resample(wav, orig_sr=sr, target_sr=16000)
+
+            duration = len(wav) / 16000.0
+            if duration < 0.3 or duration > self.max_sec:
+                continue
+
+            tokens = self.tokenizer.text_to_ids(ex["text"])
+            if len(tokens) == 0:
+                continue
+
+            yield (
+                torch.tensor(wav, dtype=torch.float32),
+                len(wav),
+                torch.tensor(tokens, dtype=torch.long),
+                len(tokens),
+            )
+
+def nemo_asr_collate(batch):
+    wavs, wav_lens, toks, tok_lens = zip(*batch)
+    max_wav = max(wav_lens)
+    max_tok = max(tok_lens)
+
+    padded_wavs = torch.zeros(len(batch), max_wav, dtype=torch.float32)
+    padded_toks = torch.zeros(len(batch), max_tok, dtype=torch.long)
+    for i, (w, t) in enumerate(zip(wavs, toks)):
+        padded_wavs[i, : len(w)] = w
+        padded_toks[i, : len(t)] = t
+
+    return (
+        padded_wavs,
+        torch.tensor(wav_lens, dtype=torch.long),
+        padded_toks,
+        torch.tensor(tok_lens, dtype=torch.long),
+    )
+
+def get_fongbe_loader(tokenizer, batch_size: int, max_sec: float, num_workers: int=0):
+    train_conf = {"train" : f"hf://datasets/{REPO_ID}/data/corpus=zindi/split=train/language=fon/*.parquet"}
+    valid_conf = {"validation" : f"hf://datasets/{REPO_ID}/data/corpus=zindi/split=validation/language=fon/*.parquet"}
+    train_data = load_stream_by_data_file(datafile=train_conf, split="train")
+    val_data = load_stream_by_data_file(valid_conf, split="validation")
+    train_ds = NeMoStreamingASRDataset(train_data, tokenizer, max_sec=max_sec)
+    val_ds = NeMoStreamingASRDataset(val_data, tokenizer, max_sec=max_sec)
+
+    train_dl = DataLoader(train_ds, batch_size=batch_size, collate_fn=nemo_asr_collate, num_workers=num_workers)
+    valid_dl = DataLoader(val_ds, batch_size=batch_size, collate_fn=nemo_asr_collate, num_workers=num_workers)
+    return train_dl, valid_dl
+
+# def get_pretrain_data(batch_size: int, max_sec: float, num_workers: int=0):
+
+    
+
+==> src/fongbe/main.py <==
+
+==> src/fongbe/model.py <==
+from nemo.collections.asr.models import ASRModel
+from nemo.utils import logging, model_utils
+
+def setup_model_for_training(config):
+    cfg = model_utils.convert_model_config_to_dict_config(config)
+    asr_model = ASRModel.from_pretrained(model_name=config.init_from_pretrained_model)
+
+    decoder = asr_model.decoder.state_dict()
+    joint_state = asr_model.joint.state_dict()
+    prev_vocab_size = asr_model.tokenizer.vocab_size
+    asr_model.change_vocabulary(new_tokenizer_dir=config.tokenizer.dir, new_tokenizer_type=config.tokenizer.type)
+    if asr_model.tokenizer.vocab_size == prev_vocab_size:
+        asr_model.decoder.load_state_dict(decoder)
+        asr_model.joint.load_state_dict(joint_state)
+
+    asr_model.setup_training_data(cfg.asr_model.train_ds)
+    asr_model.setup_validation_data(cfg.model.validation_ds)
+    asr_model.setup_optimization(cfg.model.optim)
+    return asr_model
+
+==> src/fongbe/train.py <==
+import torch
+from lightning.pytorch import Trainer
+from nemo.utils.exp_manager import exp_manager
+
+from fongbe.build import fine_tune_fongbe
+from fongbe.model import setup_model_for_training
+from fongbe import callbacks as f_call
+
+
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
+
+def get_device():
+    if torch.cuda.is_available():
+        accelerator = 'gpu'
+    else:
+        accelerator = 'gpu'
+    return accelerator
+
+def enable_gradient_checkpointing(asr_model):
+    for i, layer in enumerate(asr_model.encoder.layers):
+        asr_model.encoder.layers[i] = checkpoint_wrapper(
+            layer,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT
+    )
+
+def train_fongbe(model_name, exp_dir, repo_id):
+    config = fine_tune_fongbe.load_fongbe_cfg(model_name, exp_dir)
+    asr_model = setup_model_for_training(config)
+    callbacks = [
+        f_call.HFStreamCheckpointCallback(),
+        f_call.HFHubUploadCallback(repo_id=repo_id, exp_dir=exp_dir)
+    ]
+
+    trainer = Trainer(**config.trainer, callbacks=callbacks)
+    exp_manager(trainer, config.exp_manager)
+    return trainer
+
+
+==> src/fongbe/build/__init__.py <==
+
+==> src/fongbe/build/fine_tune_fongbe.py <==
+from fongbe.utils import load_config
+
+from pathlib import Path
+
+def load_fongbe_cfg(model_name: str| None = None, exp_dir: str| None = None):
+    tokenizer_dir = Path(__file__).parents[3].resolve() / "tokenizers/tokenizer_spe_unigram_v512"
+    config = load_config.load_finetune_config()
+    config = load_config.add_tokenizer(config, str(tokenizer_dir), "bpe")
+    config = load_config.add_data(config, "nolimitsxl/fongbe-challenge",["zindi_fon"])
+    config.exp_manager.exp_dir = exp_dir
+    if model_name:
+        config.init_from_pretrained_model = model_name
+
+    return config
+
+==> src/fongbe/callbacks/__init__.py <==
+from .hf_upload import  HFHubUploadCallback
+from .stream_callback import HFStreamCheckpointCallback
+==> src/fongbe/callbacks/hf_upload.py <==
+from pathlib import Path
+import lightning.pytorch as pl
+from huggingface_hub import HfApi
+
+class HFHubUploadCallback(pl.Callback):
+    def __init__(self, repo_id: str, exp_dir: str, token: str | None = None):
+        self.repo_id = repo_id
+        self.exp_dir = Path(exp_dir) if exp_dir else None
+        self.path_in_repo = self.path_in_repo
+        self.api = HfApi(token=token)
+        self._active_futures = None
+
+    def _resolve_log_dir(self, trainer) -> Path | None:
+        if self.exp_dir is not None:
+            return self.exp_dir
+
+        return Path(trainer.log_dir) if trainer.log_dir else None
+
+    def _flush_tensorboard(self, trainer):
+        for logger in trainer.loggers:
+            experiment = getattr(logger, "experiment", None)
+            if hasattr(experiment, "flush"):
+                experiment.flush()
+
+    def _trigger_upload(self, trainer, blocking: bool = False):
+        if not trainer.is_global_zero:
+            return
+
+        log_dir = self._resolve_log_dir(trainer)
+        if log_dir is None or not log_dir.exists():
+            return
+
+        if not blocking and self._active_futures is not None and not self._active_futures.done():
+            return
+
+        self._flush_tensorboard(trainer)
+
+        result = self.api.upload_folder(
+            folder_path=str(log_dir),
+            repo_id=self.repo_id,
+            repo_type="model",
+            path_in_repo=self.path_in_repo or None,
+            ignore_patterns=["*.tmp"],
+            run_as_future=not blocking
+        )
+
+        if not blocking:
+            self._active_futures = result
+
+    def on_validation_end(self, trainer, pl_module):
+        self._trigger_upload(trainer, blocking=False)
+
+
+    def on_train_end(self, trainer, pl_module):
+        if self._active_futures is not None:
+            self._active_futures.result()
+        self._trigger_upload(trainer, blocking=True)
+==> src/fongbe/callbacks/stream_callback.py <==
+from typing import Any
+
+import lightning.pytorch as pl
+
+class HFStreamCheckpointCallback(pl.Callback):
+    def __init__(self):
+        self._pending_state = None
+
+    def _get_hf_dataset(self, trainer):
+        dl = trainer.train_dataloader
+        if dl is None:
+            return None
+        ds = getattr(dl, "dataset", None)
+        return getattr(ds, "dataset", ds)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"hf_stream_state" : self._pending_state}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._pending_state = state_dict.get("hf_stream_state")
+
+    def on_save_checkpoint(self, trainer: pl.Trainer, pl_module: pl.LightningModule, checkpoint: dict[str, Any]) -> None:
+        hf_ds = self._get_hf_dataset(trainer)
+        if hf_ds is not None and hasattr(hf_ds, "state_dict"):
+            self._pending_state = hf_ds.state_dict()
+            checkpoint["hf_stream_state"] = self._pending_state
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if self._pending_state is not None:
+            hf_ds = self._get_hf_dataset(trainer)
+            if hf_ds is not None and hasattr(hf_ds, "load_state_dict"):
+                hf_ds.load_state_dict(self._pending_state)
+                self._pending_state = None
+==> src/fongbe/utils/__init__.py <==
+
+==> src/fongbe/utils/load_config.py <==
+from omegaconf import OmegaConf, open_dict, ListConfig,DictConfig
+from pathlib import Path
+## Finetune_fongbe config:
+
+# def 
+
+# Fongbe Finetune 
+# Data support  DOne
+# Tokenizer # Done
+# Noise Augmentation
+# Spec Augment/Data Augment#
+# load from ckpt
+
+REPOSITORY_ROOT = Path(__file__).parents[3].resolve()
+CONFIG_ROOT = REPOSITORY_ROOT / "configs"
+
+def add_tokenizer(config: ListConfig | DictConfig, tokenizer: str, t_type: str):
+    config.model.tokenizer.update_tokenizer = True
+    config.model.tokenizer.dir = tokenizer
+    config.model.tokenizer.type = t_type
+    return config
+
+# - path: ${model.data_path}
+# name: ${model.data_name}
+# split: 'train.clean.360'
+# streaming: ${model.streaming}
+# trust_remote_code: true
+
+def add_data(config: DictConfig | ListConfig, source: str,train_sets: list[str], validation_sets: list[str] | None = None):
+    config.model.data_path = source
+    config.model.streaming = True
+    train_configs = [{"path" : source, "name" : name, "split": "train", "streaming":True } for name in train_sets]
+    if validation_sets is None:
+        validation_sets = train_sets
+    validation_configs = [{"path" : source, "name" : name, "split": "validation", "streaming":True } for name in validation_sets]
+    config.model.text_key = "text"
+    config.model.train_ds.hf_data_cfg = train_configs
+    config.model.validation_ds.hf_data_cfg = validation_configs
+
+
+
+def load_finetune_config() -> ListConfig | DictConfig:
+    config = OmegaConf.load(CONFIG_ROOT / "speech_to_text_hf_finetune.yaml")
+    config.model.normalize_text = False
+    config.model.symbols_to_keep = []
+    return config
+
+
+if __name__ == '__main__':
+    print(REPOSITORY_ROOT)
+==> src/fongbe/utils/text_tools.py <==
+#!/usr/bin/env python
+"""Syllable pre-processing for the "Frugal Tonal ASR for Fongbe" leaderboard (standard library only).
+
+The leaderboard metric is the usual word error rate (WER), computed on syllables instead of words.
+The organisers apply `syllabify()` to the ground truth; participants MUST apply the same function to
+their transcriptions before submitting. The WER then counts one error for each wrong syllable:
+a wrong tone makes one syllable wrong (not the whole word), and the way words are split no longer matters.
+
+    from syllabify import syllabify
+    syllabify("Un nɔ́ ɖu nǔ")          # -> 'un nɔ1 ɖu nu3'
+
+    python syllabify.py my_transcriptions.csv my_submission.csv
+    # input: columns id, transcription (plain Fongbe text) or ID, Target
+    # output: the submission file, columns ID, Target (format of SampleSubmission.csv)
+
+What the function does:
+1. normalisation (same as normalize.py): Unicode NFD, lower case, look-alike characters fixed,
+   punctuation, digits and elision apostrophes removed; letters and tones kept;
+2. each word is cut into syllables: onset consonants + vowel (+ syllable-final n), or a syllabic consonant
+   carrying a tone (ń, m̀...);
+3. the tone of each syllable is written as a digit after it, so that it survives any further text cleaning:
+   1 = high (acute), 2 = low (grave), 3 = rising (caron), 4 = falling (circumflex), 5 = mid (macron);
+   no digit = no tone mark;
+4. the syllables are joined with single spaces.
+"""
+from __future__ import annotations
+
+import csv
+import re
+import sys
+import unicodedata
+
+# ---- normalisation: identical to normalize.tonal_target(text, digits=False) ----
+ACUTE, CARON, GRAVE, CIRCUMFLEX, MACRON = "́", "̌", "̀", "̂", "̄"
+TONES = frozenset({ACUTE, CARON, GRAVE, CIRCUMFLEX, MACRON})
+SPURIOUS = frozenset({"̧", "̈", "̣"})     # cedilla, diaeresis, dot below
+LETTERS = frozenset("abcdefghijklmnopqrstuvwxyz") | {"ɔ", "ɖ", "ɛ"}
+MARKUP = frozenset("<>+*")
+LOOK_ALIKES = {
+    "ε": "ɛ", "Ε": "ɛ", "ð": "ɖ", "đ": "ɖ", "ɗ": "ɖ",
+    "‚": ",", "“": '"', "”": '"', "‘": "'", "’": "'", "œ": "oe",
+}
+_SPACES = re.compile(r" {2,}")
+
+
+def normalize(text: str) -> str:
+    t = unicodedata.normalize("NFD", text).lower()
+    t = unicodedata.normalize("NFD", t)
+    for wrong, right in LOOK_ALIKES.items():
+        t = t.replace(wrong, right)
+    return unicodedata.normalize("NFD", t)
+
+
+def tonal_target(text: str) -> str:
+    out: list[str] = []
+    for c in normalize(text):
+        if c in TONES:
+            if out and out[-1] != " ":
+                out.append(c)
+        elif c in LETTERS or c == " ":
+            out.append(c)
+        elif c.isdigit() or c in SPURIOUS or c in MARKUP or unicodedata.category(c).startswith("P"):
+            continue
+        elif c.isspace():
+            out.append(" ")
+    return _SPACES.sub(" ", "".join(out)).strip()
+
+
+# ---- syllables: identical to score.syllables() ----
+VOWELS = set("aeiouɛɔə")
+TONE_DIGIT = {ACUTE: "1", GRAVE: "2", CARON: "3", CIRCUMFLEX: "4", MACRON: "5"}
+
+
+def _units(word):
+    out = []
+    for c in word:
+        if unicodedata.category(c).startswith("M") and out:
+            out[-1][1].append(c)
+        elif not unicodedata.category(c).startswith("M"):
+            out.append([c, []])
+    return out
+
+
+def syllables(text: str) -> list[tuple[str, str]]:
+    """List of (base, tone marks) for a text."""
+    res = []
+    for word in tonal_target(text or "").split():
+        u = _units(word); i = 0; onset = ""
+        while i < len(u):
+            b, m = u[i]
+            tone = "".join(sorted(x for x in m if x in TONES)); other = "".join(x for x in m if x not in TONES)
+            if b in VOWELS:
+                base = onset + b + other; onset = ""
+                if i + 1 < len(u) and u[i + 1][0] == "n" and not u[i + 1][1] and (i + 2 >= len(u) or u[i + 2][0] not in VOWELS):
+                    base += "n"; i += 1
+                res.append((base, tone)); i += 1
+            elif tone:
+                res.append((onset + b + other, tone)); onset = ""; i += 1
+            else:
+                onset += b + other; i += 1
+        if onset:
+            res.append((onset, ""))
+    return res
+
+
+def syllabify(text: str) -> str:
+    """Text -> space-separated syllables with tone digits, e.g. 'Un nɔ́ ɖu nǔ' -> 'un nɔ1 ɖu nu3'."""
+    return " ".join(unicodedata.normalize("NFC", base) + "".join(TONE_DIGIT[t] for t in tone)
+                    for base, tone in syllables(text))
+
+
+def _self_test() -> None:
+    assert syllabify("Un nɔ́ ɖu nǔ") == "un nɔ1 ɖu nu3"
+    assert syllabify("Kɔ́xojí, ɖ'é mɛ !") == syllabify("kɔ́ xo jí ɖé mɛ") == "kɔ1 xo ji1 ɖe1 mɛ"
+    assert syllabify("Azɔ̌mɛ 2026") == "a zɔ3 mɛ"
+    assert syllabify("") == "" and syllabify("?!") == ""
+    s = syllabify("Mǐ ná yi gbɛ̀ ń")
+    assert s == "mi3 na1 yi gbɛ2 n1", s
+    print("syllabify.py: self-test OK")
+
+
+def _convert(src: str, dst: str) -> None:
+    with open(src, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    with open(dst, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["ID", "Target"])
+        for r in rows:
+            if "ID" in r:
+                w.writerow([r["ID"], syllabify(r.get("Target") or "")])
+            else:
+                w.writerow([r["id"], syllabify(r.get("transcription") or "")])
+    print(f"{len(rows)} rows written to {dst}")
+
+def desyllabify(text: str) -> str:
+    """Replace trailing tone digits with tone marks without changing whitespace."""
+    digit_tone = {digit: mark for mark, digit in TONE_DIGIT.items()}
+
+    def restore_token(match: re.Match[str]) -> str:
+        restored = []
+        syllable_start = 0
+        for char in unicodedata.normalize("NFD", match.group(0)):
+            tone_mark = digit_tone.get(char)
+            if tone_mark is None or not restored:
+                restored.append(char)
+                continue
+
+            tone_index = next(
+                (index for index in range(len(restored) - 1, syllable_start - 1, -1)
+                 if restored[index].lower() in VOWELS),
+                next((index for index in range(len(restored) - 1, syllable_start - 1, -1)
+                      if not unicodedata.category(restored[index]).startswith("M")), None),
+            )
+            if tone_index is None:
+                restored.append(char)
+            else:
+                restored.insert(tone_index + 1, tone_mark)
+                syllable_start = len(restored)
+
+        return unicodedata.normalize("NFC", "".join(restored))
+
+    return re.sub(r"\S+", restore_token, text)
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3:
+        _convert(sys.argv[1], sys.argv[2])
+    else:
+        _self_test()
