@@ -8,7 +8,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from fongbe import callbacks as f_call
-from fongbe.build import fine_tune_fongbe
+from fongbe.recipes import fine_tune_fongbe
 from fongbe.model import setup_model_for_training
 
 
