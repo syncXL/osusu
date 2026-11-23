@@ -26,17 +26,17 @@ def add_tokenizer(config: ListConfig | DictConfig, tokenizer: str, t_type: str):
 # streaming: ${model.streaming}
 # trust_remote_code: true
 
-def add_data(config: DictConfig | ListConfig, source: str,train_sets: list[str], validation_sets: list[str] | None = None):
+def add_data(config: DictConfig | ListConfig, source: str, train_sets: list[str], validation_sets: list[str] | None = None):
     config.model.data_path = source
     config.model.streaming = True
-    train_configs = [{"path" : source, "name" : name, "split": "train", "streaming":True } for name in train_sets]
+    train_configs = [{"path": source, "name": name, "split": "train", "streaming": True} for name in train_sets]
     if validation_sets is None:
         validation_sets = train_sets
-    validation_configs = [{"path" : source, "name" : name, "split": "validation", "streaming":True } for name in validation_sets]
+    validation_configs = [{"path": source, "name": name, "split": "validation", "streaming": True} for name in validation_sets]
     config.model.text_key = "text"
     config.model.train_ds.hf_data_cfg = train_configs
     config.model.validation_ds.hf_data_cfg = validation_configs
-
+    return config
 
 
 def load_finetune_config() -> ListConfig | DictConfig:
