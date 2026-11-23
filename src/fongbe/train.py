@@ -26,7 +26,6 @@ def train_fongbe(
     repo_id: str,
     stage: str = "stage2",
     tokenizer_dir: str | None = None,
-    text_key: str | None = None,
     path_in_repo: str = "",
     smoke_test: bool = False,
 ):
