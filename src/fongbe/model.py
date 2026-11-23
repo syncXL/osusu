@@ -1,5 +1,27 @@
+import io
+import soundfile as sf
+from nemo.collections.asr.data.huggingface import hf_audio_to_text
 from nemo.collections.asr.models import ASRModel
 from nemo.utils import model_utils
+
+_orig_get_nested = hf_audio_to_text.get_nested_dict_value
+
+
+def _decode_bytes_aware_nested_get(dictionary, key):
+    # Decode raw audio bytes lazily when HF dataset uses Audio(decode=False)
+    if key.startswith("audio.") and isinstance(dictionary.get("audio"), dict):
+        audio = dictionary["audio"]
+        if "array" not in audio and ("bytes" in audio or "path" in audio):
+            raw_bytes = audio.get("bytes")
+            wav, sr = sf.read(io.BytesIO(raw_bytes) if raw_bytes is not None else audio["path"], dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)
+            audio["array"] = wav
+            audio["sampling_rate"] = sr
+    return _orig_get_nested(dictionary, key)
+
+
+hf_audio_to_text.get_nested_dict_value = _decode_bytes_aware_nested_get
 
 
 def setup_differential_lr(asr_model, encoder_lr: float, head_lr: float):
