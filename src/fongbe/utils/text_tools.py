@@ -40,6 +40,14 @@ LOOK_ALIKES = {
     "ε": "ɛ", "Ε": "ɛ", "ð": "ɖ", "đ": "ɖ", "ɗ": "ɖ",
     "‚": ",", "“": '"', "”": '"', "‘": "'", "’": "'", "œ": "oe",
 }
+
+TONE_MARKS = {
+    "1": "\u0301",  # high: acute
+    "2": "\u0300",  # low: grave
+    "3": "\u030C",  # rising: caron
+    "4": "\u0302",  # falling: circumflex
+    "5": "\u0304",  # mid: macron
+}
 _SPACES = re.compile(r" {2,}")
 
 
@@ -102,9 +110,48 @@ def syllables(text: str) -> list[tuple[str, str]]:
             res.append((onset, ""))
     return res
 
+def restore_tones(text: str) -> str:
+    def restore_token(match: re.Match) -> str:
+        restored = []
+        syllable_start = 0
+
+        for char in unicodedata.normalize("NFD", match.group()):
+            mark = TONE_MARKS.get(char)
+            if mark is None or not restored:
+                restored.append(char)
+                continue
+
+            # Put the tone on the most recent vowel in this syllable.
+            # For syllabic consonants, use the most recent base character.
+            target = next(
+                (
+                    i for i in range(len(restored) - 1, syllable_start - 1, -1)
+                    if restored[i].lower() in VOWELS
+                ),
+                next(
+                    (
+                        i for i in range(len(restored) - 1, syllable_start - 1, -1)
+                        if not unicodedata.category(restored[i]).startswith("M")
+                    ),
+                    None,
+                ),
+            )
+
+            if target is None:
+                restored.append(char)
+            else:
+                restored.insert(target + 1, mark)
+                syllable_start = len(restored)
+
+        return unicodedata.normalize("NFC", "".join(restored))
+
+    return re.sub(r"\S+", restore_token, text)
+
+
 
 def syllabify(text: str) -> str:
     """Text -> space-separated syllables with tone digits, e.g. 'Un nɔ́ ɖu nǔ' -> 'un nɔ1 ɖu nu3'."""
+    text = restore_tones(text)
     return " ".join(unicodedata.normalize("NFC", base) + "".join(TONE_DIGIT[t] for t in tone)
                     for base, tone in syllables(text))
 
@@ -160,6 +207,7 @@ def desyllabify(text: str) -> str:
         return unicodedata.normalize("NFC", "".join(restored))
 
     return re.sub(r"\S+", restore_token, text)
+
 
 if __name__ == "__main__":
     if len(sys.argv) == 3:

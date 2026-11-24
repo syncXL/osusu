@@ -19,10 +19,20 @@ def load_fongbe_cfg(
 
     config = load_config.load_finetune_config()
     config = load_config.add_tokenizer(config, str(tok_path), "bpe")
-    config = load_config.add_data(config, "nolimitsxl/fongbe-challenge", ["zindi_fon"])
+    config = load_config.add_data(config, "nolimitsxl/osusu", ["zindi_fon"])
 
     config.model.train_ds.max_duration = 60.0
     config.model.train_ds.min_duration = 0.3
+
+    # 1. Name the model & checkpoint files cleanly
+    resolved_name = f"parakeet-tdt-0.6b-fongbe-{stage}"
+    config.name = resolved_name
+    config.exp_manager.name = resolved_name
+
+    # 2. Configure checkpoint rotation & filename pattern
+    ckpt_params = config.exp_manager.checkpoint_callback_params
+    ckpt_params.filename = f"{resolved_name}--{{val_wer:.4f}}-{{step}}"
+    ckpt_params.always_save_nemo = True
 
     if stage == "stage1":
         config.model.train_ds.batch_size = 8
