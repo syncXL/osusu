@@ -65,6 +65,11 @@ def load_fongbe_cfg(
         config.trainer.max_steps * config.trainer.accumulate_grad_batches
     )
 
+    for ds_cfg in (config.model.train_ds, config.model.validation_ds):
+        ds_cfg.num_workers = 0
+        ds_cfg.pin_memory = False
+    config.model.train_ds.shuffle_n = 256
+
     config.exp_manager.exp_dir = None
     config.exp_manager.explicit_log_dir = exp_dir
 

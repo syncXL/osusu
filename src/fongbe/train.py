@@ -41,17 +41,18 @@ def train_fongbe(
     if isinstance(trainer_kwargs.get("strategy"), dict):
         trainer_kwargs["strategy"] = hydra.utils.instantiate(config.trainer.strategy)
 
-    callbacks = [
-        f_call.HFStreamCheckpointCallback(),
+    callbacks = [f_call.HFStreamCheckpointCallback()]
+    trainer = Trainer(**trainer_kwargs, callbacks=callbacks)
+    exp_manager(trainer, config.exp_manager)
+
+    # Must come AFTER exp_manager so NeMoModelCheckpoint saves & frees RAM first
+    trainer.callbacks.append(
         f_call.HFHubUploadCallback(
             repo_id=repo_id,
             exp_dir=exp_dir,
             path_in_repo=path_in_repo or stage,
-        ),
-    ]
-
-    trainer = Trainer(**trainer_kwargs, callbacks=callbacks)
-    exp_manager(trainer, config.exp_manager)
+        )
+    )
 
     head_lr = 5e-4 if stage == "stage1" else None
     asr_model = setup_model_for_training(config, trainer=trainer, head_lr=head_lr)
