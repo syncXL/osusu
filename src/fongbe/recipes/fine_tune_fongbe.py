@@ -35,8 +35,8 @@ def load_fongbe_cfg(
     ckpt_params.always_save_nemo = True
 
     if stage == "stage1":
-        config.model.train_ds.batch_size = 8
-        config.trainer.accumulate_grad_batches = 4   # 8 * 2 GPUs * 4 = 64 global batch
+        config.model.train_ds.batch_size = 4
+        config.trainer.accumulate_grad_batches = 8   # 8 * 2 GPUs * 4 = 64 global batch
         config.model.optim.lr = 1e-4
         config.model.optim.sched.warmup_steps = None
         config.model.optim.sched.warmup_ratio = 0.08
@@ -45,8 +45,8 @@ def load_fongbe_cfg(
         config.model.spec_augment.time_masks = 5
         config.model.spec_augment.time_width = 0.04
     else:
-        config.model.train_ds.batch_size = 8
-        config.trainer.accumulate_grad_batches = 2   # 8 * 2 GPUs * 2 = 32 global batch
+        config.model.train_ds.batch_size = 4
+        config.trainer.accumulate_grad_batches = 4   # 8 * 2 GPUs * 2 = 32 global batch
         config.model.optim.lr = 4e-5
         config.model.optim.sched.warmup_steps = None
         config.model.optim.sched.warmup_ratio = 0.10
