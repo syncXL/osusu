@@ -32,7 +32,8 @@ def load_fongbe_cfg(
     # 2. Configure checkpoint rotation & filename pattern
     ckpt_params = config.exp_manager.checkpoint_callback_params
     ckpt_params.filename = f"{resolved_name}--{{val_wer:.4f}}-{{step}}"
-    ckpt_params.always_save_nemo = True
+    ckpt_params.always_save_nemo = False
+    ckpt_params.save_nemo_on_train_end = True  # Exports .nemo once cleanly at the end
 
     if stage == "stage1":
         config.model.train_ds.batch_size = 4
@@ -66,6 +67,7 @@ def load_fongbe_cfg(
 
     config.exp_manager.exp_dir = None
     config.exp_manager.explicit_log_dir = exp_dir
+
     config.exp_manager.checkpoint_callback_params.save_top_k = 1
     config.exp_manager.checkpoint_callback_params.save_last = True
 
