@@ -3,6 +3,7 @@ from fongbe.utils import load_config
 
 
 def load_fongbe_cfg(
+    run_name: str | None = None,
     model_name: str | None = None,
     exp_dir: str | None = None,
     stage: str = "stage2",

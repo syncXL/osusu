@@ -21,11 +21,12 @@ def enable_gradient_checkpointing(asr_model):
 
 
 def train_fongbe(
-    model_name: str | None,
+    model_name: str,
     exp_dir: str,
     repo_id: str,
     stage: str = "stage2",
     tokenizer_dir: str | None = None,
+    run_name: str | None = None,
     path_in_repo: str = "",
     smoke_test: bool = False,
     upload_every_n_epochs: int = 1
@@ -37,7 +38,12 @@ def train_fongbe(
         tokenizer_dir=tokenizer_dir,
         smoke_test=smoke_test,
     )
-
+    if run_name:
+        config.name = run_name
+        config.exp_manager.name = run_name
+        config.exp_manager.checkpoint_callback_params.filename = (
+            f"{run_name}--{{val_wer:.4f}}-{{step}}"
+        )
     trainer_kwargs = OmegaConf.to_container(config.trainer, resolve=True)
     if isinstance(trainer_kwargs.get("strategy"), dict):
         trainer_kwargs["strategy"] = hydra.utils.instantiate(config.trainer.strategy)
