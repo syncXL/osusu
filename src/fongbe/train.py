@@ -32,6 +32,7 @@ def train_fongbe(
     upload_every_n_epochs: int = 1
 ):
     config = fine_tune_fongbe.load_fongbe_cfg(
+        run_name=run_name,
         model_name=model_name,
         exp_dir=exp_dir,
         stage=stage,

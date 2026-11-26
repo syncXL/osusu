@@ -1,4 +1,5 @@
 from pathlib import Path
+from omegaconf import open_dict
 from fongbe.utils import load_config
 
 
@@ -24,9 +25,17 @@ def load_fongbe_cfg(
 
     config.model.train_ds.max_duration = 60.0
     config.model.train_ds.min_duration = 0.3
+    config.model.validation_ds.max_duration = 60.0
+
+    with open_dict(config.model):
+        config.model.train_ds.batch_duration = 60.0
+        if "joint" not in config.model or config.model.joint is None:
+            config.model.joint = {}
+        config.model.joint.fused_batch_size = 1
+        config.model.joint.fuse_loss_wer = True
 
     # 1. Name the model & checkpoint files cleanly
-    resolved_name = f"parakeet-tdt-0.6b-fongbe-{stage}"
+    resolved_name = run_name or f"parakeet-tdt-0.6b-fongbe-{stage}"
     config.name = resolved_name
     config.exp_manager.name = resolved_name
 
@@ -36,9 +45,11 @@ def load_fongbe_cfg(
     ckpt_params.always_save_nemo = False
     ckpt_params.save_nemo_on_train_end = True  # Exports .nemo once cleanly at the end
 
+    config.model.train_ds.batch_size = 2
+    config.model.validation_ds.batch_size = 2
+
     if stage == "stage1":
-        config.model.train_ds.batch_size = 4
-        config.trainer.accumulate_grad_batches = 8   # 8 * 2 GPUs * 4 = 64 global batch
+        config.trainer.accumulate_grad_batches = 16  # 16 * 2 GPUs * 2 = 64 global batch
         config.model.optim.lr = 1e-4
         config.model.optim.sched.warmup_steps = None
         config.model.optim.sched.warmup_ratio = 0.08
@@ -47,8 +58,7 @@ def load_fongbe_cfg(
         config.model.spec_augment.time_masks = 5
         config.model.spec_augment.time_width = 0.04
     else:
-        config.model.train_ds.batch_size = 4
-        config.trainer.accumulate_grad_batches = 4   # 8 * 2 GPUs * 2 = 32 global batch
+        config.trainer.accumulate_grad_batches = 8   # 8 * 2 GPUs * 2 = 32 global batch
         config.model.optim.lr = 4e-5
         config.model.optim.sched.warmup_steps = None
         config.model.optim.sched.warmup_ratio = 0.10
@@ -61,9 +71,10 @@ def load_fongbe_cfg(
         config.trainer.log_every_n_steps = 5
         config.trainer.limit_val_batches = 5
 
-    # Required integer batch limit for NeMo HF streaming
+    # Required integer batch limit for NeMo HF streaming (1 epoch of micro-batches)
+    steps_per_epoch = config.trainer.max_steps // config.trainer.max_epochs
     config.trainer.limit_train_batches = (
-        config.trainer.max_steps * config.trainer.accumulate_grad_batches
+        steps_per_epoch * config.trainer.accumulate_grad_batches
     )
 
     for ds_cfg in (config.model.train_ds, config.model.validation_ds):

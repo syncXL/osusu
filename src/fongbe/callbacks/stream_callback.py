@@ -11,7 +11,12 @@ class HFStreamCheckpointCallback(pl.Callback):
         if dl is None:
             return None
         ds = getattr(dl, "dataset", None)
-        return getattr(ds, "dataset", ds)
+        while ds is not None and not (hasattr(ds, "state_dict") and hasattr(ds, "load_state_dict")):
+            nxt = getattr(ds, "dataset", None)
+            if nxt is ds:
+                return None
+            ds = nxt
+        return ds
 
     def state_dict(self) -> dict[str, Any]:
         return {"hf_stream_state" : self._pending_state}
