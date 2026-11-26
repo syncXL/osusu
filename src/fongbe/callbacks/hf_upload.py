@@ -9,10 +9,17 @@ from lightning.pytorch.callbacks import Callback
 
 
 class HFHubUploadCallback(Callback):
-    def __init__(self, repo_id: str, exp_dir: str, path_in_repo: str = ""):
+    def __init__(
+        self,
+        repo_id: str,
+        exp_dir: str,
+        path_in_repo: str = "",
+        upload_every_n_epochs: int = 1,
+    ):
         self.repo_id = repo_id
         self.exp_dir = Path(exp_dir)
         self.path_in_repo = path_in_repo
+        self.upload_every_n_epochs = max(1, upload_every_n_epochs)
         self.api = HfApi()
 
     def _upload(self, trainer):
@@ -28,10 +35,9 @@ class HFHubUploadCallback(Callback):
             delete_patterns=["checkpoints/*.ckpt"],
         )
 
-    def on_validation_end(self, trainer, pl_module):
-        if trainer.sanity_checking:
-            return
-        self._upload(trainer)
+    def on_train_epoch_end(self, trainer, pl_module):
+        if (trainer.current_epoch + 1) % self.upload_every_n_epochs == 0:
+            self._upload(trainer)
 
     def on_train_end(self, trainer, pl_module):
         self._upload(trainer)

@@ -144,10 +144,10 @@ model:
 trainer:
   devices: -1
   num_nodes: 1
-  max_epochs: 500
-  limit_train_batches: 4188
-  max_steps: 4188
-  val_check_interval: 100
+  max_epochs: 10
+  limit_train_batches: 16704
+  max_steps: 41760
+  val_check_interval: 4000
   check_val_every_n_epoch: 1
   accelerator: auto
   strategy:

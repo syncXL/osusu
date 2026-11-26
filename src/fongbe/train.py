@@ -28,6 +28,7 @@ def train_fongbe(
     tokenizer_dir: str | None = None,
     path_in_repo: str = "",
     smoke_test: bool = False,
+    upload_every_n_epochs: int = 1
 ):
     config = fine_tune_fongbe.load_fongbe_cfg(
         model_name=model_name,
@@ -51,8 +52,10 @@ def train_fongbe(
             repo_id=repo_id,
             exp_dir=exp_dir,
             path_in_repo=path_in_repo or stage,
-        )
+            upload_every_n_epochs=upload_every_n_epochs,
+            )
     )
+
 
     head_lr = 5e-4 if stage == "stage1" else None
     asr_model = setup_model_for_training(config, trainer=trainer, head_lr=head_lr)
