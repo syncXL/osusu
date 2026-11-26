@@ -163,6 +163,7 @@ trainer:
   enable_checkpointing: false
   logger: false
   benchmark: false
+  
 
 
 exp_manager:

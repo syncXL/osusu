@@ -46,6 +46,7 @@ class DynamicDurationBatchDataset(IterableDataset):
         min_duration: float | None = None,
         max_duration: float | None = None,
         collate_fn=None,
+        cycle: bool = False,
     ):
         super().__init__()
         self.dataset = dataset
@@ -56,6 +57,8 @@ class DynamicDurationBatchDataset(IterableDataset):
         self.min_duration = min_duration
         self.max_duration = max_duration
         self.collate_fn = collate_fn if collate_fn is not None else getattr(dataset, "collate_fn", None)
+        self.cycle = bool(cycle)
+        self._pass = 0
 
     def _duration_sec(self, sample: Any) -> float:
         if isinstance(sample, dict):
@@ -86,19 +89,33 @@ class DynamicDurationBatchDataset(IterableDataset):
             yield self.collate_fn(batch) if self.collate_fn is not None else batch
 
     def __iter__(self):
-        buf: list[tuple[float, Any]] = []
-        for sample in self.dataset:
-            dur = self._duration_sec(sample)
-            if self.min_duration is not None and dur < self.min_duration:
-                continue
-            if self.max_duration is not None and dur > self.max_duration:
-                continue
-            buf.append((dur, sample))
-            if len(buf) >= self.sort_buffer_size:
+        while True:
+            buf: list[tuple[float, Any]] = []
+            yielded_any = False
+            for sample in self.dataset:
+                dur = self._duration_sec(sample)
+                if self.min_duration is not None and dur < self.min_duration:
+                    continue
+                if self.max_duration is not None and dur > self.max_duration:
+                    continue
+                yielded_any = True
+                buf.append((dur, sample))
+                if len(buf) >= self.sort_buffer_size:
+                    yield from self._emit_sorted_batches(buf)
+                    buf.clear()
+            if buf:
                 yield from self._emit_sorted_batches(buf)
-                buf.clear()
-        if buf:
-            yield from self._emit_sorted_batches(buf)
+
+            if not self.cycle or not yielded_any:
+                break
+
+            self._pass += 1
+            ds = self._resolve_stateful_dataset()
+            if ds is not None:
+                if hasattr(ds, "_starting_state_dict"):
+                    ds._starting_state_dict = None
+                if hasattr(ds, "set_epoch"):
+                    ds.set_epoch(self._pass)
 
     def _resolve_stateful_dataset(self):
         ds = self.dataset
@@ -111,14 +128,21 @@ class DynamicDurationBatchDataset(IterableDataset):
 
     def state_dict(self):
         ds = self._resolve_stateful_dataset()
-        if ds is not None:
-            return ds.state_dict()
-        return {}
+        hf_state = ds.state_dict() if ds is not None else {}
+        return {"pass": self._pass, "hf_state": hf_state}
 
     def load_state_dict(self, state_dict):
+        if not isinstance(state_dict, dict):
+            return
+        if "hf_state" in state_dict:
+            self._pass = int(state_dict.get("pass", 0))
+            hf_state = state_dict["hf_state"]
+        else:
+            hf_state = state_dict
+            self._pass = int(hf_state.get("epoch", 0)) if isinstance(hf_state, dict) else 0
         ds = self._resolve_stateful_dataset()
-        if ds is not None:
-            ds.load_state_dict(state_dict)
+        if ds is not None and hf_state is not None:
+            ds.load_state_dict(hf_state)
 
 
 def _apply_joint_config(asr_model, joint_cfg) -> None:
@@ -196,6 +220,7 @@ def setup_model_for_training(config, trainer=None, head_lr: float | None = None)
             min_duration=cfg.model.train_ds.get("min_duration"),
             max_duration=cfg.model.train_ds.get("max_duration"),
             collate_fn=collate_fn,
+            cycle=True,
         )
         asr_model._train_dl = DataLoader(
             dynamic_ds,

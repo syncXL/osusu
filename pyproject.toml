@@ -8,6 +8,8 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "compressed-tensors>=0.15.0",
+    "fire>=0.7.1",
     "matplotlib>=3.11.2",
     "nemo-toolkit[all]",
     "text-unidecode>=1.3",

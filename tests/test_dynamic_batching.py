@@ -1,3 +1,4 @@
+import itertools
 import os
 
 # Allow importing NeMo on CPU-only environments without nvidia cuda-python bindings
@@ -24,6 +25,9 @@ class FakeHFStream(IterableDataset):
         super().__init__()
         self.durations_sec = list(durations_sec)
         self._cursor = 0
+        self._starting_state_dict = None
+        self.epoch = 0
+        self.epochs_seen: list[int] = []
         self.saved_states: list[dict] = []
         self.loaded_states: list[dict] = []
 
@@ -40,14 +44,21 @@ class FakeHFStream(IterableDataset):
                 "utterance_id": idx,
             }
 
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+        self.epochs_seen.append(epoch)
+        self._cursor = 0
+
     def state_dict(self):
-        state = {"cursor": self._cursor}
+        state = {"cursor": self._cursor, "epoch": self.epoch}
         self.saved_states.append(state)
         return state
 
     def load_state_dict(self, state_dict):
         self.loaded_states.append(dict(state_dict))
+        self._starting_state_dict = dict(state_dict)
         self._cursor = state_dict["cursor"]
+        self.epoch = state_dict.get("epoch", 0)
 
 
 class FakeNeMoHFIterableWrapper(IterableDataset):
@@ -157,22 +168,89 @@ def test_state_dict_delegation_and_stream_callback():
     next(it)  # consumes first 2-item buffer -> cursor == 2
 
     state = ds.state_dict()
-    assert state == {"cursor": 2}
-    assert stream.saved_states == [{"cursor": 2}]
+    assert state == {"pass": 0, "hf_state": {"cursor": 2, "epoch": 0}}
+    assert stream.saved_states == [{"cursor": 2, "epoch": 0}]
 
-    ds.load_state_dict({"cursor": 3})
-    assert stream.loaded_states[-1] == {"cursor": 3}
+    # New state dict format restores _pass and underlying HF stream state
+    ds.load_state_dict({"pass": 2, "hf_state": {"cursor": 3, "epoch": 2}})
+    assert ds._pass == 2
+    assert stream.loaded_states[-1] == {"cursor": 3, "epoch": 2}
 
-    # Verify HFStreamCheckpointCallback interacts cleanly with DataLoader(DynamicDurationBatchDataset)
+    # Backwards-compatible legacy raw HF state dict (no "hf_state" wrapper)
+    ds.load_state_dict({"cursor": 1, "epoch": 0})
+    assert ds._pass == 0
+    assert stream.loaded_states[-1] == {"cursor": 1, "epoch": 0}
+
+    # Live multi-epoch save must NOT stage _pending_state or reload on next epoch start
     cb = HFStreamCheckpointCallback()
     fake_trainer = SimpleNamespace(train_dataloader=dl)
     ckpt = {}
+    loaded_before = len(stream.loaded_states)
     cb.on_save_checkpoint(fake_trainer, None, ckpt)
-    assert ckpt["hf_stream_state"] == {"cursor": 3}
+    assert ckpt["hf_stream_state"] == {"pass": 0, "hf_state": {"cursor": 1, "epoch": 0}}
+    assert cb._pending_state is None
+    assert cb.state_dict() == {}
 
-    cb.load_state_dict({"hf_stream_state": {"cursor": 1}})
     cb.on_train_epoch_start(fake_trainer, None)
-    assert stream.loaded_states[-1] == {"cursor": 1}
+    assert len(stream.loaded_states) == loaded_before
+
+    # Resuming via on_load_checkpoint stages _pending_state and restores once on epoch start
+    cb.on_load_checkpoint(fake_trainer, None, {"hf_stream_state": {"pass": 1, "hf_state": {"cursor": 4, "epoch": 1}}})
+    assert cb._pending_state is not None
+    cb.on_train_epoch_start(fake_trainer, None)
+    assert ds._pass == 1
+    assert stream.loaded_states[-1] == {"cursor": 4, "epoch": 1}
+    assert cb._pending_state is None
+
+    # Subsequent epoch start must not re-apply old state
+    cb.on_train_epoch_start(fake_trainer, None)
+    assert len(stream.loaded_states) == loaded_before + 1
+
+
+def test_dynamic_batching_cycle_and_empty_exit():
+    # Stream with 3 short items (2 batches per pass with bs=2, sort_buffer_size=32)
+    stream = FakeHFStream([2.0, 3.0, 4.0])
+    stream._starting_state_dict = {"cursor": 0, "epoch": 0}
+    wrapper = FakeNeMoHFIterableWrapper(stream)
+    ds = DynamicDurationBatchDataset(
+        dataset=wrapper,
+        max_batch_duration=60.0,
+        max_batch_size=2,
+        sample_rate=SAMPLE_RATE,
+        sort_buffer_size=32,
+        collate_fn=wrapper.collate_fn,
+        cycle=True,
+    )
+    dl = DataLoader(ds, batch_size=None, num_workers=0)
+
+    # Pull 5 batches (spans pass 0, pass 1, and into pass 2)
+    batches = list(itertools.islice(dl, 5))
+    assert len(batches) == 5
+    assert ds._pass == 2
+    assert stream.epochs_seen == [1, 2]
+    assert stream._starting_state_dict is None
+
+    # When all samples are filtered out, cycle=True must terminate cleanly instead of hanging
+    filtered_stream = FakeHFStream([0.1, 0.2])
+    filtered_ds = DynamicDurationBatchDataset(
+        dataset=filtered_stream,
+        max_batch_duration=60.0,
+        max_batch_size=2,
+        sample_rate=SAMPLE_RATE,
+        min_duration=0.5,
+        cycle=True,
+    )
+    assert list(filtered_ds) == []
+
+    # Empty underlying stream with cycle=True also exits cleanly
+    empty_ds = DynamicDurationBatchDataset(
+        dataset=FakeHFStream([]),
+        max_batch_duration=60.0,
+        max_batch_size=2,
+        sample_rate=SAMPLE_RATE,
+        cycle=True,
+    )
+    assert list(empty_ds) == []
 
 
 def test_recipe_config_and_env_vars():
@@ -236,5 +314,6 @@ def test_setup_model_for_training_joint_timing_chunking_and_dl_wrap():
     mock_model.change_subsampling_conv_chunking_factor.assert_called_once_with(1)
     assert isinstance(mock_model._train_dl, DataLoader)
     assert isinstance(mock_model._train_dl.dataset, DynamicDurationBatchDataset)
+    assert mock_model._train_dl.dataset.cycle is True
     assert mock_model._train_dl.batch_size is None
     assert mock_model._train_dl.num_workers == 0
