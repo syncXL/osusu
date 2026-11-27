@@ -22,8 +22,9 @@ Fine-tune NVIDIA `nvidia/parakeet-tdt-0.6b-v3` (617M params, FastConformer encod
   - Transcripts are already preprocessed (`syllables` column for Stage 2; `text` column for Stage 1).
 
 ## Training Stages
-- **Stage 1 (Multilingual CPT):** `tokenizers/tokenizer_spe_unigram_v1024`, `text_key="text"`, global batch = 64, encoder LR `1e-4`, head LR `5e-4`.
-- **Stage 2 (Fongbe FT):** `tokenizers/tokenizer_spe_unigram_v512`, `text_key="syllables"`, global batch = 32, uniform LR `4e-5`, 10 epochs (`4,176` steps/epoch, `41,760` total steps).
+- **Stage 1 (Multilingual CPT):** `tokenizers/tokenizer_spe_unigram_v1024`, `text_key="text"`, global batch = 64, encoder LR `1e-4`, head LR `5e-4`, `warmup_steps = 500`, `gradient_clip_val = 1.0`.
+- **Stage 2 (Fongbe FT):** `tokenizers/tokenizer_spe_unigram_v512`, `text_key="syllables"`, global batch = 32, uniform LR `4e-5`, `warmup_steps = 500`, `gradient_clip_val = 1.0`, `val_check_interval = 8352` (`33408 / 4`), 10 epochs (`4,176` steps/epoch, `41,760` total steps).
+- **Overrides (`src/fongbe/train.py`):** `train_fongbe(...)` accepts `encoder_lr`, `head_lr`, and `warmup_steps` to configure fresh or Stage 1 -> Stage 2 runs without editing code.
 
 ## Critical Invariants (Do Not Break)
 1. **Callback order (`src/fongbe/train.py`):** `HFHubUploadCallback` MUST be appended *after* `exp_manager(trainer, config.exp_manager)` so `NeMoModelCheckpoint` writes checkpoints and frees ~7.4 GB RAM before upload runs.
@@ -32,3 +33,4 @@ Fine-tune NVIDIA `nvidia/parakeet-tdt-0.6b-v3` (617M params, FastConformer encod
 4. **Joint config timing (`src/fongbe/model.py`):** Copy `fused_batch_size` onto `asr_model.cfg.joint` *before* calling `asr_model.change_vocabulary(...)`.
 5. **Encoder activation checkpointing (`src/fongbe/train.py`):** Keep `asr_model.encoder.layers` wrapped with `checkpoint_wrapper(..., checkpoint_impl=CheckpointImpl.NO_REENTRANT)`.
 6. **Stream resumability & DDP epoch cycling (`src/fongbe/callbacks/stream_callback.py`, `src/fongbe/model.py`):** Training wraps `_train_dl` with `DynamicDurationBatchDataset(..., cycle=True)` so DDP ranks never hit `StopIteration` before `limit_train_batches`. Any custom wrapper around `_train_dl.dataset` must expose `state_dict()` and `load_state_dict()` delegating to the underlying HF `IterableDataset`. `HFStreamCheckpointCallback` must only stage `_pending_state` in `on_load_checkpoint` (never in `on_save_checkpoint`), so live multi-epoch runs do not reload end-of-epoch stream state on the next epoch.
+7. **Differential LR persistence (`src/fongbe/model.py`):** `setup_differential_lr()` must bind a custom method onto `asr_model.setup_optimizer_param_groups` using `types.MethodType` (filtering `p.requires_grad` for `encoder` vs non-`encoder` params) so NeMo `setup_optimization()` / Lightning `configure_optimizers()` cannot wipe the custom param groups.

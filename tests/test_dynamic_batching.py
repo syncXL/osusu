@@ -13,8 +13,9 @@ from torch.utils.data import DataLoader, IterableDataset
 
 import fongbe
 from fongbe.callbacks.stream_callback import HFStreamCheckpointCallback
-from fongbe.model import DynamicDurationBatchDataset, setup_model_for_training
+from fongbe.model import DynamicDurationBatchDataset, setup_differential_lr, setup_model_for_training
 from fongbe.recipes.fine_tune_fongbe import load_fongbe_cfg
+from fongbe.train import resolve_head_lr, train_fongbe
 
 
 SAMPLE_RATE = 16000
@@ -268,12 +269,20 @@ def test_recipe_config_and_env_vars():
     assert cfg_s2.trainer.accumulate_grad_batches == 8
     assert cfg_s2.trainer.max_steps == 41760
     assert cfg_s2.trainer.limit_train_batches == 4176 * 8
+    assert cfg_s2.trainer.val_check_interval == 8352
+    assert cfg_s2.trainer.limit_train_batches % cfg_s2.trainer.val_check_interval == 0
+    assert cfg_s2.trainer.gradient_clip_val == 1.0
+    assert cfg_s2.model.optim.sched.warmup_steps == 500
+    assert cfg_s2.model.optim.sched.warmup_ratio is None
 
     cfg_s1 = load_fongbe_cfg(stage="stage1", smoke_test=False)
     assert cfg_s1.model.train_ds.batch_size == 2
     assert cfg_s1.model.validation_ds.batch_size == 2
     assert cfg_s1.trainer.accumulate_grad_batches == 16
     assert cfg_s1.trainer.limit_train_batches == 4176 * 16
+    assert cfg_s1.trainer.gradient_clip_val == 1.0
+    assert cfg_s1.model.optim.sched.warmup_steps == 500
+    assert cfg_s1.model.optim.sched.warmup_ratio is None
 
     cfg_smoke = load_fongbe_cfg(stage="stage2", smoke_test=True)
     assert cfg_smoke.trainer.max_epochs == 1
@@ -317,3 +326,101 @@ def test_setup_model_for_training_joint_timing_chunking_and_dl_wrap():
     assert mock_model._train_dl.dataset.cycle is True
     assert mock_model._train_dl.batch_size is None
     assert mock_model._train_dl.num_workers == 0
+
+
+def test_setup_differential_lr_persists_across_setup_optimizer_param_groups():
+    class FakeASRModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Linear(8, 8)
+            self.frozen_enc = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+            self.encoder.register_parameter("frozen", self.frozen_enc)
+            self.decoder = torch.nn.Linear(8, 4)
+            self.joint = torch.nn.Linear(4, 5)
+            self._optimizer_param_groups = None
+
+        def setup_optimizer_param_groups(self):
+            # Simulates NeMo ModelPT.setup_optimizer_param_groups wiping custom groups
+            self._optimizer_param_groups = [{"params": list(self.parameters())}]
+
+    model = FakeASRModule()
+    setup_differential_lr(model, encoder_lr=1e-4, head_lr=5e-4)
+
+    assert len(model._optimizer_param_groups) == 2
+    assert model._optimizer_param_groups[0]["lr"] == 1e-4
+    assert model._optimizer_param_groups[1]["lr"] == 5e-4
+    assert all(p.requires_grad for g in model._optimizer_param_groups for p in g["params"])
+    assert len(model._optimizer_param_groups[0]["params"]) == 2  # encoder weight + bias only
+    assert len(model._optimizer_param_groups[1]["params"]) == 4  # decoder + joint weights/biases
+
+    # Simulate NeMo setup_optimization() / Lightning configure_optimizers() re-calling setup_optimizer_param_groups()
+    model._optimizer_param_groups = None
+    model.setup_optimizer_param_groups()
+    assert len(model._optimizer_param_groups) == 2
+    assert model._optimizer_param_groups[0]["lr"] == 1e-4
+    assert model._optimizer_param_groups[1]["lr"] == 5e-4
+
+
+def test_train_fongbe_lr_and_warmup_overrides(tmp_path):
+    assert resolve_head_lr("stage1", encoder_lr=1e-4, head_lr=None) == 5e-4
+    assert resolve_head_lr("stage2", encoder_lr=4e-5, head_lr=None) is None
+    assert resolve_head_lr("stage1", encoder_lr=1e-4, head_lr=1e-4) is None
+    assert resolve_head_lr("stage2", encoder_lr=1e-4, head_lr=3e-4) == 3e-4
+
+    captured = []
+
+    def fake_setup(config, trainer=None, head_lr=None):
+        captured.append((config, head_lr))
+        m = MagicMock()
+        m.encoder.layers = []
+        return m
+
+    with (
+        patch("fongbe.train.Trainer", return_value=MagicMock(callbacks=[])),
+        patch("fongbe.train.exp_manager"),
+        patch("fongbe.train.setup_model_for_training", side_effect=fake_setup),
+    ):
+        train_fongbe(
+            model_name="dummy/model",
+            exp_dir=str(tmp_path / "exp1"),
+            repo_id="dummy/repo",
+            stage="stage2",
+            encoder_lr=1.5e-4,
+            head_lr=4.5e-4,
+            warmup_steps=250,
+        )
+        train_fongbe(
+            model_name="dummy/model",
+            exp_dir=str(tmp_path / "exp2"),
+            repo_id="dummy/repo",
+            stage="stage1",
+            encoder_lr=2e-4,
+            head_lr=2e-4,
+            warmup_steps=300,
+        )
+
+    cfg1, h1 = captured[0]
+    assert cfg1.model.optim.lr == 1.5e-4
+    assert cfg1.model.optim.sched.warmup_steps == 250
+    assert cfg1.model.optim.sched.warmup_ratio is None
+    assert h1 == 4.5e-4
+
+    cfg2, h2 = captured[1]
+    assert cfg2.model.optim.lr == 2e-4
+    assert cfg2.model.optim.sched.warmup_steps == 300
+    assert cfg2.model.optim.sched.warmup_ratio is None
+    assert h2 is None
+
+    # Also verify setup_model_for_training skips setup_differential_lr when head_lr == optim.lr
+    cfg_eq = load_fongbe_cfg(stage="stage2", smoke_test=True, encoder_lr=1e-4)
+    mock_model = MagicMock()
+    mock_model.tokenizer.vocab_size = 1024
+    with (
+        patch("fongbe.model.ASRModel.from_pretrained", return_value=mock_model),
+        patch("fongbe.model.setup_differential_lr") as mock_diff,
+    ):
+        setup_model_for_training(cfg_eq, head_lr=1e-4)
+        setup_model_for_training(cfg_eq, head_lr=None)
+        mock_diff.assert_not_called()
+        setup_model_for_training(cfg_eq, head_lr=3e-4)
+        mock_diff.assert_called_once_with(mock_model, encoder_lr=1e-4, head_lr=3e-4)

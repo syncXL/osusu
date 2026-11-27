@@ -20,6 +20,14 @@ def enable_gradient_checkpointing(asr_model):
         )
 
 
+def resolve_head_lr(stage: str, encoder_lr: float, head_lr: float | None) -> float | None:
+    """Resolve effective head LR; returns None when uniform LR should be used."""
+    if head_lr is not None:
+        resolved = float(head_lr)
+        return None if resolved == float(encoder_lr) else resolved
+    return 5e-4 if stage == "stage1" else None
+
+
 def train_fongbe(
     model_name: str,
     exp_dir: str,
@@ -29,7 +37,10 @@ def train_fongbe(
     run_name: str | None = None,
     path_in_repo: str = "",
     smoke_test: bool = False,
-    upload_every_n_epochs: int = 1
+    upload_every_n_epochs: int = 1,
+    encoder_lr: float | None = None,
+    head_lr: float | None = None,
+    warmup_steps: int | None = None,
 ):
     config = fine_tune_fongbe.load_fongbe_cfg(
         run_name=run_name,
@@ -38,6 +49,8 @@ def train_fongbe(
         stage=stage,
         tokenizer_dir=tokenizer_dir,
         smoke_test=smoke_test,
+        encoder_lr=encoder_lr,
+        warmup_steps=warmup_steps,
     )
     if run_name:
         config.name = run_name
@@ -63,9 +76,12 @@ def train_fongbe(
             )
     )
 
-
-    head_lr = 5e-4 if stage == "stage1" else None
-    asr_model = setup_model_for_training(config, trainer=trainer, head_lr=head_lr)
+    resolved_head_lr = resolve_head_lr(
+        stage=stage,
+        encoder_lr=float(config.model.optim.lr),
+        head_lr=head_lr,
+    )
+    asr_model = setup_model_for_training(config, trainer=trainer, head_lr=resolved_head_lr)
     enable_gradient_checkpointing(asr_model)
 
     return trainer, asr_model

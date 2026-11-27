@@ -10,6 +10,8 @@ def load_fongbe_cfg(
     stage: str = "stage2",
     tokenizer_dir: str | None = None,
     smoke_test: bool = False,
+    encoder_lr: float | None = None,
+    warmup_steps: int | None = None,
 ):
     repo_root = Path(__file__).parents[3].resolve()
     default_tok = (
@@ -47,21 +49,23 @@ def load_fongbe_cfg(
 
     config.model.train_ds.batch_size = 2
     config.model.validation_ds.batch_size = 2
+    config.trainer.gradient_clip_val = 1.0
 
     if stage == "stage1":
         config.trainer.accumulate_grad_batches = 16  # 16 * 2 GPUs * 2 = 64 global batch
         config.model.optim.lr = 1e-4
-        config.model.optim.sched.warmup_steps = None
-        config.model.optim.sched.warmup_ratio = 0.08
+        config.model.optim.sched.warmup_steps = 500
+        config.model.optim.sched.warmup_ratio = None
         config.model.optim.sched.min_lr = 1e-6
         config.model.spec_augment.freq_width = 20
         config.model.spec_augment.time_masks = 5
         config.model.spec_augment.time_width = 0.04
     else:
         config.trainer.accumulate_grad_batches = 8   # 8 * 2 GPUs * 2 = 32 global batch
+        config.trainer.val_check_interval = 8352     # 33408 / 4 = 8352 micro-batches (1,044 steps)
         config.model.optim.lr = 4e-5
-        config.model.optim.sched.warmup_steps = None
-        config.model.optim.sched.warmup_ratio = 0.10
+        config.model.optim.sched.warmup_steps = 500
+        config.model.optim.sched.warmup_ratio = None
         config.model.optim.sched.min_lr = 1e-6
 
     if smoke_test:
@@ -70,6 +74,14 @@ def load_fongbe_cfg(
         config.trainer.val_check_interval = 10
         config.trainer.log_every_n_steps = 5
         config.trainer.limit_val_batches = 5
+        config.model.optim.sched.warmup_steps = 5
+        config.model.optim.sched.warmup_ratio = None
+
+    if encoder_lr is not None:
+        config.model.optim.lr = float(encoder_lr)
+    if warmup_steps is not None:
+        config.model.optim.sched.warmup_steps = int(warmup_steps)
+        config.model.optim.sched.warmup_ratio = None
 
     # Required integer batch limit for NeMo HF streaming (1 epoch of micro-batches)
     steps_per_epoch = config.trainer.max_steps // config.trainer.max_epochs

@@ -1,4 +1,5 @@
 import io
+import types
 from typing import Any
 
 import soundfile as sf
@@ -169,13 +170,22 @@ def _apply_joint_config(asr_model, joint_cfg) -> None:
 
 
 def setup_differential_lr(asr_model, encoder_lr: float, head_lr: float):
-    enc_params = list(asr_model.encoder.parameters())
-    enc_ids = {id(p) for p in enc_params}
-    head_params = [p for p in asr_model.parameters() if id(p) not in enc_ids]
-    asr_model._optimizer_param_groups = [
-        {"params": enc_params, "lr": encoder_lr},
-        {"params": head_params, "lr": head_lr},
-    ]
+    def _setup_optimizer_param_groups(self):
+        enc_params = [p for p in self.encoder.parameters() if p.requires_grad]
+        enc_ids = {id(p) for p in enc_params}
+        head_params = [
+            p for p in self.parameters()
+            if p.requires_grad and id(p) not in enc_ids
+        ]
+        groups = []
+        if enc_params:
+            groups.append({"params": enc_params, "lr": float(encoder_lr)})
+        if head_params:
+            groups.append({"params": head_params, "lr": float(head_lr)})
+        self._optimizer_param_groups = groups
+
+    asr_model.setup_optimizer_param_groups = types.MethodType(_setup_optimizer_param_groups, asr_model)
+    asr_model.setup_optimizer_param_groups()
 
 
 def setup_model_for_training(config, trainer=None, head_lr: float | None = None):
@@ -231,8 +241,8 @@ def setup_model_for_training(config, trainer=None, head_lr: float | None = None)
 
     asr_model.setup_validation_data(cfg.model.validation_ds)
 
-    if head_lr is not None:
-        setup_differential_lr(asr_model, encoder_lr=cfg.model.optim.lr, head_lr=head_lr)
+    if head_lr is not None and float(head_lr) != float(cfg.model.optim.lr):
+        setup_differential_lr(asr_model, encoder_lr=float(cfg.model.optim.lr), head_lr=float(head_lr))
 
     asr_model.setup_optimization(cfg.model.optim)
     return asr_model
