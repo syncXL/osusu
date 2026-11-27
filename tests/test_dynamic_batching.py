@@ -1,4 +1,5 @@
 import itertools
+import logging
 import os
 
 # Allow importing NeMo on CPU-only environments without nvidia cuda-python bindings
@@ -7,6 +8,7 @@ os.environ.setdefault("NUMBA_CUDA_USE_NVIDIA_BINDING", "0")
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, IterableDataset
@@ -301,10 +303,22 @@ def test_setup_model_for_training_joint_timing_chunking_and_dl_wrap():
     mock_model.cfg = OmegaConf.create({
         "joint": {"fuse_loss_wer": True, "fused_batch_size": 4},
         "decoding": {"fused_batch_size": None},
+        "loss": {"loss_name": "tdt", "tdt_kwargs": {"durations": [0, 1, 2, 3, 4]}},
+        "rnnt_reduction": "mean_batch",
     })
     mock_model.joint = MagicMock()
     mock_model.joint._cfg = OmegaConf.create({"fuse_loss_wer": True, "fused_batch_size": 4})
-    mock_model.tokenizer.vocab_size = 1024
+    mock_model.joint.num_classes_with_blank = 518
+    mock_model.joint.num_extra_outputs = 5
+    mock_model.joint.fuse_loss_wer = True
+    mock_model.tokenizer.vocab_size = 512
+    mock_model.extract_rnnt_loss_cfg.return_value = ("tdt", {"durations": [0, 1, 2, 3, 4]})
+
+    class _FakeTDTInnerLoss:
+        pass
+
+    _FakeTDTInnerLoss.__name__ = "TDTLoss"
+    fake_loss_instance = MagicMock(_loss=_FakeTDTInnerLoss())
 
     def fake_change_vocab(**kwargs):
         call_order.append(("change_vocabulary", mock_model.cfg.joint.fused_batch_size, mock_model.joint._cfg.fused_batch_size))
@@ -315,17 +329,101 @@ def test_setup_model_for_training_joint_timing_chunking_and_dl_wrap():
     mock_model.change_vocabulary.side_effect = fake_change_vocab
     mock_model.setup_training_data.side_effect = fake_setup_train_dl
 
-    with patch("fongbe.model.ASRModel.from_pretrained", return_value=mock_model):
+    with (
+        patch("fongbe.model.ASRModel.from_pretrained", return_value=mock_model),
+        patch("fongbe.model.RNNTLoss", return_value=fake_loss_instance) as mock_rnnt_loss,
+    ):
         result = setup_model_for_training(cfg)
 
     assert result is mock_model
     assert call_order == [("change_vocabulary", 1, 1)]
+    mock_rnnt_loss.assert_called_once_with(
+        num_classes=512,
+        loss_name="tdt",
+        loss_kwargs={"durations": [0, 1, 2, 3, 4]},
+        reduction="mean_batch",
+    )
+    mock_model.change_decoding_strategy.assert_called_once()
+    mock_model.joint.set_loss.assert_called_once_with(fake_loss_instance)
+    mock_model.joint.set_wer.assert_called_once_with(mock_model.wer)
     mock_model.change_subsampling_conv_chunking_factor.assert_called_once_with(1)
     assert isinstance(mock_model._train_dl, DataLoader)
     assert isinstance(mock_model._train_dl.dataset, DynamicDurationBatchDataset)
     assert mock_model._train_dl.dataset.cycle is True
     assert mock_model._train_dl.batch_size is None
     assert mock_model._train_dl.num_workers == 0
+
+
+def test_restore_tdt_loss_and_decoding_validations(caplog):
+    from fongbe.model import _restore_tdt_loss_and_decoding
+
+    durations = [0, 1, 2, 3, 4]
+    loss_kwargs = {"fastemit_lambda": 0.0, "clamp": -1.0, "durations": durations}
+
+    class _FakeTDTLoss:
+        pass
+
+    _FakeTDTLoss.__name__ = "TDTLoss"
+
+    def _make_model(vocab_size=512, num_classes_with_blank=518, num_extra=5, fuse_loss_wer=True):
+        m = MagicMock()
+        m.cfg = OmegaConf.create({
+            "loss": {"loss_name": "tdt", "tdt_kwargs": loss_kwargs},
+            "decoding": {"strategy": "greedy_batch", "durations": durations},
+            "rnnt_reduction": "mean_batch",
+        })
+        m.tokenizer.vocab_size = vocab_size
+        m.joint.num_classes_with_blank = num_classes_with_blank
+        m.joint.num_extra_outputs = num_extra
+        m.joint.fuse_loss_wer = fuse_loss_wer
+        m.extract_rnnt_loss_cfg.return_value = ("tdt", loss_kwargs)
+        return m
+
+    # 1. Valid TDT restore with fuse_loss_wer=True
+    model = _make_model()
+    fake_loss = MagicMock(_loss=_FakeTDTLoss())
+    with patch("fongbe.model.RNNTLoss", return_value=fake_loss) as mock_loss_cls:
+        _restore_tdt_loss_and_decoding(model)
+
+    mock_loss_cls.assert_called_once_with(
+        num_classes=512,
+        loss_name="tdt",
+        loss_kwargs=loss_kwargs,
+        reduction="mean_batch",
+    )
+    model.change_decoding_strategy.assert_called_once_with({"strategy": "greedy_batch", "durations": durations}, verbose=False)
+    model.joint.set_loss.assert_called_once_with(fake_loss)
+    model.joint.set_wer.assert_called_once_with(model.wer)
+
+    # 2. fuse_loss_wer=False does not re-wire joint.set_loss / set_wer
+    model_no_fuse = _make_model(fuse_loss_wer=False)
+    with patch("fongbe.model.RNNTLoss", return_value=fake_loss):
+        _restore_tdt_loss_and_decoding(model_no_fuse)
+    model_no_fuse.joint.set_loss.assert_not_called()
+    model_no_fuse.joint.set_wer.assert_not_called()
+
+    # 3. Real RNNTLoss instantiation builds TDTLoss cleanly without falling back to plain RNN-T
+    model_real_loss = _make_model(vocab_size=512, num_classes_with_blank=518, num_extra=5)
+    with caplog.at_level(logging.INFO, logger="nemo_logger"):
+        _restore_tdt_loss_and_decoding(model_real_loss)
+    assert "tdt" in type(model_real_loss.loss._loss).__name__.lower()
+    assert "TDT loss restored: num_classes=512, num_extra_outputs=5, durations=[0, 1, 2, 3, 4]" in caplog.text
+
+    # 4. Fails loudly if num_classes != vocab_size (e.g. blank+durations off-by-N)
+    model_bad_vocab = _make_model(vocab_size=512, num_classes_with_blank=518, num_extra=0)
+    with patch("fongbe.model.RNNTLoss", return_value=fake_loss):
+        with pytest.raises(AssertionError, match="TDT num_classes mismatch"):
+            _restore_tdt_loss_and_decoding(model_bad_vocab)
+
+    # 5. Fails loudly if plain RNNTLoss slips in instead of TDT
+    class _PlainRNNTLoss:
+        pass
+
+    _PlainRNNTLoss.__name__ = "RNNTLossNumba"
+    model_bad_impl = _make_model()
+    with patch("fongbe.model.RNNTLoss", return_value=MagicMock(_loss=_PlainRNNTLoss())):
+        with pytest.raises(AssertionError, match="Expected TDT loss implementation"):
+            _restore_tdt_loss_and_decoding(model_bad_impl)
 
 
 def test_setup_differential_lr_persists_across_setup_optimizer_param_groups():
@@ -417,6 +515,7 @@ def test_train_fongbe_lr_and_warmup_overrides(tmp_path):
     mock_model.tokenizer.vocab_size = 1024
     with (
         patch("fongbe.model.ASRModel.from_pretrained", return_value=mock_model),
+        patch("fongbe.model._restore_tdt_loss_and_decoding"),
         patch("fongbe.model.setup_differential_lr") as mock_diff,
     ):
         setup_model_for_training(cfg_eq, head_lr=1e-4)

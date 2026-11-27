@@ -1,13 +1,18 @@
+import copy
 import io
+import os
+import tarfile
 import types
-from typing import Any
+from typing import Any, Mapping
 
 import soundfile as sf
+import torch
 from omegaconf import open_dict
 from torch.utils.data import DataLoader, IterableDataset
 from nemo.collections.asr.data.huggingface import hf_audio_to_text
+from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.models import ASRModel
-from nemo.utils import model_utils
+from nemo.utils import logging, model_utils
 
 _orig_get_nested = hf_audio_to_text.get_nested_dict_value
 
@@ -188,12 +193,116 @@ def setup_differential_lr(asr_model, encoder_lr: float, head_lr: float):
     asr_model.setup_optimizer_param_groups()
 
 
-def setup_model_for_training(config, trainer=None, head_lr: float | None = None):
+def extract_encoder_state_dict(raw_state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Extract `encoder.*` weights from a NeMo/Lightning checkpoint and strip prefixes."""
+    sd: Mapping[str, torch.Tensor] = raw_state_dict
+    if "state_dict" in sd and isinstance(sd["state_dict"], Mapping):
+        sd = sd["state_dict"]
+
+    encoder_sd: dict[str, torch.Tensor] = {}
+    for key, tensor in sd.items():
+        k = key
+        if k.startswith("module."):
+            k = k[len("module.") :]
+        if k.startswith("model."):
+            k = k[len("model.") :]
+        if k.startswith("encoder."):
+            sub_key = k[len("encoder.") :]
+            sub_key = sub_key.replace("._checkpoint_wrapped_module.", ".")
+            sub_key = sub_key.replace("pre_encode.pre_encode.", "pre_encode.")
+            encoder_sd[sub_key] = tensor
+
+    if not encoder_sd:
+        raise ValueError("No 'encoder.*' weights found in checkpoint state dict.")
+    return encoder_sd
+
+
+def load_encoder_state_dict_from_source(source_path: str) -> dict[str, torch.Tensor]:
+    """Load stripped encoder weights from a `.nemo` archive or Lightning `.ckpt` file."""
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Encoder source file not found: '{source_path}'")
+
+    if source_path.endswith(".nemo") or tarfile.is_tarfile(source_path):
+        with tarfile.open(source_path, "r:*") as tar:
+            ckpt_member = next(
+                (m for m in tar.getmembers() if m.isfile() and os.path.basename(m.name) == "model_weights.ckpt"),
+                None,
+            )
+            if ckpt_member is None:
+                raise ValueError(f"No 'model_weights.ckpt' found inside NeMo archive '{source_path}'.")
+            raw_bytes = tar.extractfile(ckpt_member).read()
+            raw_sd = torch.load(io.BytesIO(raw_bytes), map_location="cpu", weights_only=False)
+    else:
+        raw_sd = torch.load(source_path, map_location="cpu", weights_only=False)
+
+    return extract_encoder_state_dict(raw_sd)
+
+
+def _restore_tdt_loss_and_decoding(asr_model) -> None:
+    """Restore TDT loss, decoding strategy, and fused joint bindings after `change_vocabulary()`.
+
+    NeMo's `EncDecRNNTBPEModel.change_vocabulary()` resets `asr_model.loss` to default
+    plain RNN-T loss with `num_classes = num_classes_with_blank - 1` (ignoring `loss_name="tdt"`
+    and `num_extra_outputs`). Rebuilding `RNNTLoss` from `asr_model.cfg.loss` and re-wiring
+    `joint.set_loss` / `joint.set_wer` prevents silent non-TDT training and wrong blank indices.
+    """
+    loss_name, loss_kwargs = asr_model.extract_rnnt_loss_cfg(asr_model.cfg.get("loss", None))
+    durations = list(loss_kwargs["durations"]) if loss_kwargs and "durations" in loss_kwargs else []
+    num_classes = int(asr_model.joint.num_classes_with_blank) - 1
+    if loss_name == "tdt":
+        num_classes -= int(asr_model.joint.num_extra_outputs)
+
+    asr_model.loss = RNNTLoss(
+        num_classes=num_classes,
+        loss_name=loss_name,
+        loss_kwargs=copy.deepcopy(loss_kwargs) if loss_kwargs is not None else None,
+        reduction=asr_model.cfg.get("rnnt_reduction", "mean_batch"),
+    )
+    asr_model.change_decoding_strategy(copy.deepcopy(asr_model.cfg.decoding), verbose=False)
+    if getattr(asr_model.joint, "fuse_loss_wer", False):
+        asr_model.joint.set_loss(asr_model.loss)
+        asr_model.joint.set_wer(asr_model.wer)
+
+    if loss_name == "tdt":
+        vocab_size = int(asr_model.tokenizer.vocab_size)
+        assert num_classes == vocab_size, (
+            f"TDT num_classes mismatch after change_vocabulary(): "
+            f"expected vocab_size={vocab_size}, got num_classes={num_classes}"
+        )
+        num_extra = int(asr_model.joint.num_extra_outputs)
+        assert num_extra == len(durations), (
+            f"TDT num_extra_outputs mismatch: joint has {num_extra}, "
+            f"loss_kwargs['durations'] has {len(durations)} ({durations})"
+        )
+        loss_impl_name = type(asr_model.loss._loss).__name__
+        assert "tdt" in loss_impl_name.lower(), (
+            f"Expected TDT loss implementation after restore, got '{loss_impl_name}'"
+        )
+        logging.info(
+            f"TDT loss restored: num_classes={num_classes}, "
+            f"num_extra_outputs={num_extra}, durations={durations}"
+        )
+
+
+def setup_model_for_training(
+    config,
+    trainer=None,
+    head_lr: float | None = None,
+    init_encoder_from: str | None = None,
+):
     cfg = model_utils.convert_model_config_to_dict_config(config)
-    asr_model = ASRModel.from_pretrained(model_name=cfg.init_from_pretrained_model)
+    model_source = cfg.get("init_from_nemo_model") or cfg.get("init_from_pretrained_model")
+    if model_source and os.path.exists(str(model_source)) and str(model_source).endswith(".nemo"):
+        asr_model = ASRModel.restore_from(str(model_source))
+    else:
+        asr_model = ASRModel.from_pretrained(model_name=cfg.init_from_pretrained_model)
 
     if trainer is not None:
         asr_model.set_trainer(trainer)
+
+    if init_encoder_from:
+        encoder_sd = load_encoder_state_dict_from_source(init_encoder_from)
+        asr_model.encoder.load_state_dict(encoder_sd, strict=True)
 
     decoder_state = asr_model.decoder.state_dict()
     joint_state = asr_model.joint.state_dict()
@@ -209,6 +318,8 @@ def setup_model_for_training(config, trainer=None, head_lr: float | None = None)
     if asr_model.tokenizer.vocab_size == prev_vocab_size:
         asr_model.decoder.load_state_dict(decoder_state)
         asr_model.joint.load_state_dict(joint_state)
+
+    _restore_tdt_loss_and_decoding(asr_model)
 
     if hasattr(asr_model, "change_subsampling_conv_chunking_factor"):
         asr_model.change_subsampling_conv_chunking_factor(1)

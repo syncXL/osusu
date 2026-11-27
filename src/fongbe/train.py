@@ -41,6 +41,7 @@ def train_fongbe(
     encoder_lr: float | None = None,
     head_lr: float | None = None,
     warmup_steps: int | None = None,
+    init_encoder_from: str | None = None,
 ):
     config = fine_tune_fongbe.load_fongbe_cfg(
         run_name=run_name,
@@ -81,7 +82,10 @@ def train_fongbe(
         encoder_lr=float(config.model.optim.lr),
         head_lr=head_lr,
     )
-    asr_model = setup_model_for_training(config, trainer=trainer, head_lr=resolved_head_lr)
+    setup_kwargs = {"trainer": trainer, "head_lr": resolved_head_lr}
+    if init_encoder_from is not None:
+        setup_kwargs["init_encoder_from"] = init_encoder_from
+    asr_model = setup_model_for_training(config, **setup_kwargs)
     enable_gradient_checkpointing(asr_model)
 
     return trainer, asr_model
