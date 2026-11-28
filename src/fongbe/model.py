@@ -151,6 +151,29 @@ class DynamicDurationBatchDataset(IterableDataset):
             ds.load_state_dict(hf_state)
 
 
+def _set_joint_fused_batch_size(asr_model, fused_batch_size: int = 1) -> None:
+    """Enforce `fused_batch_size` on `asr_model.joint` and decoding/joint configs."""
+    bs = int(fused_batch_size)
+    for target in (
+        getattr(asr_model.cfg, "joint", None),
+        getattr(getattr(asr_model, "joint", None), "_cfg", None),
+        getattr(asr_model.cfg, "decoding", None),
+    ):
+        if target is None:
+            continue
+        with open_dict(target):
+            target.fused_batch_size = bs
+
+    joint = getattr(asr_model, "joint", None)
+    if joint is not None:
+        if hasattr(joint, "set_fused_batch_size"):
+            joint.set_fused_batch_size(bs)
+        try:
+            joint.fused_batch_size = bs
+        except AttributeError:
+            pass
+
+
 def _apply_joint_config(asr_model, joint_cfg) -> None:
     if joint_cfg is None:
         return
@@ -168,10 +191,7 @@ def _apply_joint_config(asr_model, joint_cfg) -> None:
             if fuse_loss_wer is not None:
                 target.fuse_loss_wer = fuse_loss_wer
     if fused_bs is not None:
-        decoding_cfg = getattr(asr_model.cfg, "decoding", None)
-        if decoding_cfg is not None and decoding_cfg.get("fused_batch_size") is not None:
-            with open_dict(decoding_cfg):
-                decoding_cfg.fused_batch_size = fused_bs
+        _set_joint_fused_batch_size(asr_model, int(fused_bs))
 
 
 def setup_differential_lr(asr_model, encoder_lr: float, head_lr: float):
@@ -259,6 +279,7 @@ def _restore_tdt_loss_and_decoding(asr_model) -> None:
         reduction=asr_model.cfg.get("rnnt_reduction", "mean_batch"),
     )
     asr_model.change_decoding_strategy(copy.deepcopy(asr_model.cfg.decoding), verbose=False)
+    _set_joint_fused_batch_size(asr_model, 1)
     if getattr(asr_model.joint, "fuse_loss_wer", False):
         asr_model.joint.set_loss(asr_model.loss)
         asr_model.joint.set_wer(asr_model.wer)
@@ -299,6 +320,8 @@ def setup_model_for_training(
 
     if trainer is not None:
         asr_model.set_trainer(trainer)
+
+    _set_joint_fused_batch_size(asr_model, 1)
 
     if init_encoder_from:
         encoder_sd = load_encoder_state_dict_from_source(init_encoder_from)

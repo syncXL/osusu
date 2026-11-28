@@ -30,7 +30,7 @@ def load_fongbe_cfg(
     config.model.validation_ds.max_duration = 60.0
 
     with open_dict(config.model):
-        config.model.train_ds.batch_duration = 60.0
+        config.model.train_ds.batch_duration = 48.0 if stage == "stage2" else 60.0
         if "joint" not in config.model or config.model.joint is None:
             config.model.joint = {}
         config.model.joint.fused_batch_size = 1

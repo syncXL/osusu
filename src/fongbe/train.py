@@ -1,3 +1,8 @@
+import datetime
+import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import hydra
 from omegaconf import OmegaConf
 from lightning.pytorch import Trainer
@@ -38,6 +43,8 @@ def train_fongbe(
     path_in_repo: str = "",
     smoke_test: bool = False,
     upload_every_n_epochs: int = 1,
+    upload_on_val: bool = True,
+    upload_every_n_val_checks: int = 1,
     encoder_lr: float | None = None,
     head_lr: float | None = None,
     warmup_steps: int | None = None,
@@ -61,7 +68,10 @@ def train_fongbe(
         )
     trainer_kwargs = OmegaConf.to_container(config.trainer, resolve=True)
     if isinstance(trainer_kwargs.get("strategy"), dict):
-        trainer_kwargs["strategy"] = hydra.utils.instantiate(config.trainer.strategy)
+        trainer_kwargs["strategy"] = hydra.utils.instantiate(
+            config.trainer.strategy,
+            timeout=datetime.timedelta(minutes=5),
+        )
 
     callbacks = [f_call.HFStreamCheckpointCallback()]
     trainer = Trainer(**trainer_kwargs, callbacks=callbacks)
@@ -74,7 +84,9 @@ def train_fongbe(
             exp_dir=exp_dir,
             path_in_repo=path_in_repo or stage,
             upload_every_n_epochs=upload_every_n_epochs,
-            )
+            upload_on_val=upload_on_val,
+            upload_every_n_val_checks=upload_every_n_val_checks,
+        )
     )
 
     resolved_head_lr = resolve_head_lr(

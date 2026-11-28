@@ -265,7 +265,7 @@ def test_recipe_config_and_env_vars():
     assert cfg_s2.model.validation_ds.batch_size == 2
     assert cfg_s2.model.train_ds.max_duration == 60.0
     assert cfg_s2.model.validation_ds.max_duration == 60.0
-    assert cfg_s2.model.train_ds.batch_duration == 60.0
+    assert cfg_s2.model.train_ds.batch_duration == 48.0
     assert cfg_s2.model.joint.fused_batch_size == 1
     assert cfg_s2.model.joint.fuse_loss_wer is True
     assert cfg_s2.trainer.accumulate_grad_batches == 8
@@ -523,3 +523,133 @@ def test_train_fongbe_lr_and_warmup_overrides(tmp_path):
         mock_diff.assert_not_called()
         setup_model_for_training(cfg_eq, head_lr=3e-4)
         mock_diff.assert_called_once_with(mock_model, encoder_lr=1e-4, head_lr=3e-4)
+
+
+def test_t4_headroom_fused_batch_size_55s_clip_and_ddp_timeout(tmp_path):
+    import datetime
+    from fongbe.model import _restore_tdt_loss_and_decoding
+
+    assert os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True"
+
+    # 1. Read-only property joint mimicking real NeMo RNNTJoint enforces fused_batch_size == 1
+    class _ReadOnlyJoint:
+        def __init__(self):
+            self._fused_batch_size = 8
+            self._cfg = OmegaConf.create({"fused_batch_size": 8, "fuse_loss_wer": True})
+            self.num_classes_with_blank = 518
+            self.num_extra_outputs = 5
+            self.fuse_loss_wer = True
+            self.set_loss = MagicMock()
+            self.set_wer = MagicMock()
+
+        @property
+        def fused_batch_size(self):
+            return self._fused_batch_size
+
+        def set_fused_batch_size(self, value):
+            self._fused_batch_size = value
+
+    class _FakeTDTLoss:
+        pass
+
+    _FakeTDTLoss.__name__ = "TDTLoss"
+
+    model = MagicMock()
+    model.cfg = OmegaConf.create({
+        "joint": {"fused_batch_size": 8, "fuse_loss_wer": True},
+        "decoding": {"fused_batch_size": 8},
+        "loss": {"loss_name": "tdt", "tdt_kwargs": {"durations": [0, 1, 2, 3, 4]}},
+        "rnnt_reduction": "mean_batch",
+    })
+    model.joint = _ReadOnlyJoint()
+    model.tokenizer.vocab_size = 512
+    model.extract_rnnt_loss_cfg.return_value = ("tdt", {"durations": [0, 1, 2, 3, 4]})
+
+    with patch("fongbe.model.RNNTLoss", return_value=MagicMock(_loss=_FakeTDTLoss())):
+        _restore_tdt_loss_and_decoding(model)
+
+    assert model.joint.fused_batch_size == 1
+    assert model.cfg.joint.fused_batch_size == 1
+    assert model.cfg.decoding.fused_batch_size == 1
+
+    # 2. max_batch_duration=48.0 with max_duration=60.0 still keeps & yields a single 55s utterance
+    stream_55 = FakeHFStream([55.0, 10.0])
+    ds = DynamicDurationBatchDataset(
+        dataset=stream_55,
+        max_batch_duration=48.0,
+        max_batch_size=2,
+        sample_rate=SAMPLE_RATE,
+        sort_buffer_size=32,
+        min_duration=0.3,
+        max_duration=60.0,
+        cycle=False,
+    )
+    batches = list(ds)
+    durs = [[x["a_sig_length"].item() / SAMPLE_RATE for x in b] for b in batches]
+    assert durs == [[10.0], [55.0]]
+
+    # 3. train_fongbe configures DDPStrategy timeout=5min and passes upload_on_val to callback
+    fake_trainer = MagicMock(callbacks=[])
+    fake_model = MagicMock()
+    fake_model.encoder.layers = []
+    with (
+        patch("fongbe.train.hydra.utils.instantiate", return_value="mock_strategy") as mock_inst,
+        patch("fongbe.train.Trainer", return_value=fake_trainer),
+        patch("fongbe.train.exp_manager"),
+        patch("fongbe.train.setup_model_for_training", return_value=fake_model),
+    ):
+        train_fongbe(
+            model_name="dummy/model",
+            exp_dir=str(tmp_path / "exp"),
+            repo_id="dummy/repo",
+            stage="stage2",
+            upload_on_val=True,
+        )
+
+    assert mock_inst.call_args.kwargs["timeout"] == datetime.timedelta(minutes=5)
+    upload_cb = fake_trainer.callbacks[-1]
+    assert upload_cb.upload_on_val is True
+
+
+def test_hf_upload_callback_on_validation_end(tmp_path):
+    from fongbe.callbacks.hf_upload import HFHubUploadCallback
+
+    exp_dir = tmp_path / "exp"
+    exp_dir.mkdir()
+
+    cb = HFHubUploadCallback(
+        repo_id="dummy/repo",
+        exp_dir=str(exp_dir),
+        path_in_repo="stage2",
+        upload_on_val=True,
+    )
+    cb.api = MagicMock()
+
+    # Skips sanity checking even on rank 0
+    cb.on_validation_end(SimpleNamespace(is_global_zero=True, sanity_checking=True), None)
+    cb.api.upload_folder.assert_not_called()
+
+    # Skips non-rank-0
+    cb.on_validation_end(SimpleNamespace(is_global_zero=False, sanity_checking=False), None)
+    cb.api.upload_folder.assert_not_called()
+
+    # Uploads on rank 0 after real validation
+    cb.on_validation_end(SimpleNamespace(is_global_zero=True, sanity_checking=False), None)
+    cb.api.upload_folder.assert_called_once_with(
+        folder_path=str(exp_dir),
+        repo_id="dummy/repo",
+        repo_type="model",
+        path_in_repo="stage2",
+        ignore_patterns=["*.tmp", "*-unfinished*"],
+        delete_patterns=["checkpoints/*.ckpt"],
+    )
+
+    # Disabled upload_on_val does not upload on validation end
+    cb_off = HFHubUploadCallback(
+        repo_id="dummy/repo",
+        exp_dir=str(exp_dir),
+        upload_on_val=False,
+    )
+    cb_off.api = MagicMock()
+    cb_off.on_validation_end(SimpleNamespace(is_global_zero=True, sanity_checking=False), None)
+    cb_off.api.upload_folder.assert_not_called()

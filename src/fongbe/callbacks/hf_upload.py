@@ -1,11 +1,10 @@
-from pathlib import Path
-from lightning.pytorch.callbacks import Callback
-from huggingface_hub import HfApi
-
 import gc
+import logging
 from pathlib import Path
 from huggingface_hub import HfApi
 from lightning.pytorch.callbacks import Callback
+
+logger = logging.getLogger(__name__)
 
 
 class HFHubUploadCallback(Callback):
@@ -15,25 +14,40 @@ class HFHubUploadCallback(Callback):
         exp_dir: str,
         path_in_repo: str = "",
         upload_every_n_epochs: int = 1,
+        upload_on_val: bool = True,
+        upload_every_n_val_checks: int = 1,
     ):
         self.repo_id = repo_id
         self.exp_dir = Path(exp_dir)
         self.path_in_repo = path_in_repo
         self.upload_every_n_epochs = max(1, upload_every_n_epochs)
+        self.upload_on_val = bool(upload_on_val)
+        self.upload_every_n_val_checks = max(1, int(upload_every_n_val_checks))
+        self._val_checks = 0
         self.api = HfApi()
 
     def _upload(self, trainer):
         if not trainer.is_global_zero or not self.exp_dir.exists():
             return
         gc.collect()
-        self.api.upload_folder(
-            folder_path=str(self.exp_dir),
-            repo_id=self.repo_id,
-            repo_type="model",
-            path_in_repo=self.path_in_repo or None,
-            ignore_patterns=["*.tmp", "*-unfinished*"],
-            delete_patterns=["checkpoints/*.ckpt"],
-        )
+        try:
+            self.api.upload_folder(
+                folder_path=str(self.exp_dir),
+                repo_id=self.repo_id,
+                repo_type="model",
+                path_in_repo=self.path_in_repo or None,
+                ignore_patterns=["*.tmp", "*-unfinished*"],
+                delete_patterns=["checkpoints/*.ckpt"],
+            )
+        except Exception as exc:
+            logger.warning("HF Hub upload failed for %s: %s", self.exp_dir, exc)
+
+    def on_validation_end(self, trainer, pl_module):
+        if not self.upload_on_val or getattr(trainer, "sanity_checking", False):
+            return
+        self._val_checks += 1
+        if self._val_checks % self.upload_every_n_val_checks == 0:
+            self._upload(trainer)
 
     def on_train_epoch_end(self, trainer, pl_module):
         if (trainer.current_epoch + 1) % self.upload_every_n_epochs == 0:
